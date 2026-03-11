@@ -1,0 +1,16 @@
+# Secrets - NEVER commit
+.env
+.env.local
+.env.*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Supabase temp files
+supabase/.temp/
+supabase/.branches/
+
+# Poetry
+.venv/
