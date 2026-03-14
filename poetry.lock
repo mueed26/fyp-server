@@ -288,6 +288,25 @@ files = [
 ]
 
 [[package]]
+name = "clerk-backend-api"
+version = "5.0.2"
+description = "Python Client SDK for clerk.dev"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "clerk_backend_api-5.0.2-py3-none-any.whl", hash = "sha256:33e26c678841cdb7072a8de86e0ddbe75cbeb178075dbb6f690e47f6e8426e7e"},
+    {file = "clerk_backend_api-5.0.2.tar.gz", hash = "sha256:289eb90a5a40cab34260062ee1f01f899e574731fb065c57aa822aec70867c27"},
+]
+
+[package.dependencies]
+cryptography = ">=45.0.0,<47.0.0"
+httpcore = ">=1.0.9"
+httpx = ">=0.28.1"
+pydantic = ">=2.11.2"
+pyjwt = ">=2.9.0,<3.0.0"
+
+[[package]]
 name = "click"
 version = "8.3.1"
 description = "Composable command line interface toolkit"
@@ -1986,4 +2005,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13"
-content-hash = "f5d45bad2aaa331bf307e8f880d58abc9f1f7a628899f4727553004e323b065f"
+content-hash = "d60362aff1729257961ad9d55186a8f8f719432d73483a388792674d7cb10a7e"
