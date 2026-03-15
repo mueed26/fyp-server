@@ -16,7 +16,7 @@ import os
 
 load_dotenv()
 
-from routes import users, projects
+from routers import users, projects, files, chats
 
 
 # Create FastAPI app
@@ -37,9 +37,10 @@ app.add_middleware(
 
 
 app.include_router(users.router)
-
-
 app.include_router(projects.router)
+app.include_router(files.router)
+app.include_router(chats.router)
+
 
 # Health check endpoints
 @app.get("/")
