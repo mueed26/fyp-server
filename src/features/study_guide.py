@@ -1,8 +1,7 @@
 """
 Study Guide Generation Pipeline.
-
-- 10 or fewer chunks: single LLM call (cheap, fast)
-- More than 10 chunks: map/reduce (handles large docs)
+- 80 or fewer chunks: single LLM call
+- More than 80 chunks: map/reduce
 """
 
 from typing import List
@@ -40,9 +39,9 @@ def _reduce(docs: List[Document]) -> str:
     prompt = ChatPromptTemplate.from_messages([
         ("user",
          "The following are study guide chunks:\n{docs}\n\n"
-         "Distill into a single cohesive study guide. Maintain key concepts, "
-         "definitions, examples, and main points. Format in Markdown with "
-         "clear headings and bullet points.")
+         "Distill into a single cohesive study guide. Maintain ALL key concepts, "
+         "definitions, examples, formulas, and important details. Do NOT summarize or shorten — "
+         "keep all the detail. Format in Markdown with clear headings and bullet points.")
     ])
     docs_text = "\n\n".join(doc.page_content for doc in docs)
     response = llm.invoke(prompt.invoke({"docs": docs_text}))
@@ -50,18 +49,24 @@ def _reduce(docs: List[Document]) -> str:
 
 
 def _single_call_study_guide(all_text: str) -> str:
-    """Generate study guide in one LLM call — used for small documents."""
+    """Generate study guide in one LLM call."""
     llm = openAI["features_llm"]
     prompt = ChatPromptTemplate.from_messages([
         ("user",
-         "Create a comprehensive study guide from the following document content.\n\n"
+         "Create a VERY DETAILED and COMPREHENSIVE study guide from the following document content.\n\n"
          "**Instructions:**\n"
-         "- Include key concepts and definitions\n"
-         "- Add examples and illustrations where relevant\n"
-         "- Highlight important points to remember\n"
+         "- Cover EVERY topic and subtopic in the document — do not skip anything\n"
+         "- Include ALL key concepts with full definitions and explanations\n"
+         "- Include ALL formulas, equations, and technical details\n"
+         "- Add examples and illustrations for each concept where relevant\n"
+         "- Include relationships and comparisons between concepts\n"
+         "- Highlight important points to remember for exams\n"
          "- Use ## headings for major topics\n"
-         "- Use bullet points (-) for key points\n"
-         "- Use **bold** for important terms\n"
+         "- Use ### subheadings for subtopics\n"
+         "- Use bullet points (-) for key points under each topic\n"
+         "- Use **bold** for important terms and definitions\n"
+         "- Be thorough — this is the student's PRIMARY study resource\n"
+         "- Aim for at least 1500-2000 words\n"
          "- Return in Markdown format\n\n"
          "Content:\n{content}")
     ])
@@ -82,11 +87,14 @@ def generate_study_guide(contents: List[str]) -> str:
     llm = openAI["features_llm"]
     map_prompt = ChatPromptTemplate.from_messages([
         ("user",
-         "Create structured study notes for the following text. Include:\n"
-         "- Key concepts / definitions\n"
-         "- Examples or illustrations\n"
-         "- Important points\n"
-         "Format as bullet points:\n\n{context}")
+         "Create detailed structured study notes for the following text. Include:\n"
+         "- ALL key concepts with full definitions\n"
+         "- ALL formulas, equations, technical details\n"
+         "- Examples or illustrations for each concept\n"
+         "- Important points to remember\n"
+         "- Relationships between concepts\n"
+         "Do NOT summarize — keep all detail.\n"
+         "Format as bullet points with headings:\n\n{context}")
     ])
 
     guide_chunks = []

@@ -11,11 +11,17 @@ from src.rag.ingestion.utils import (
     get_page_number,
     create_ai_summary,
 )
+
+#unstructure uses poppler to extract text images and tables 
+#tessaract optical character recognition(ocr) for scanned documents
+#libmagic to analyse file type and file content
 from src.models.index import ProcessingStatus
 from unstructured.chunking.title import chunk_by_title
 from src.services.webScrapper import scrapingbee_client
 import tempfile
 
+
+#entry point for the celetry worker.. mark status as processing and then fetch documnet record  from supabase to get s3 key and filename
 def process_document(document_id: str):
     """
     * Step 1 : Download from S3 (file) or Crawl the URL (url) and Extract text, tables, and images from the PDF (using Unstructured Library) from the AWS S3 document.
@@ -26,6 +32,8 @@ def process_document(document_id: str):
     *   - `processing_details` : What type of elements or metadata did we retrieve from the document to show in the UI.
     """
 
+
+#changes status once partition, chunking etc is done
     try:
         update_status_in_database(document_id, ProcessingStatus.PROCESSING)
 

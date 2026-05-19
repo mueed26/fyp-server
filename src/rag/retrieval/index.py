@@ -10,19 +10,10 @@ from src.rag.retrieval.utils import (
 from typing import List, Dict
 from src.rag.retrieval.utils import rrf_rank_and_fuse
 
-
+#the agent calls this and runs selected search strategy 
 def retrieve_context(project_id, user_query):
     try:
-        """
-        RAG Retrieval Pipeline Steps:
-        * Step 1: Get user's project settings from the database.
-        * Step 2: Retrieve the document IDs for the current project.
-        * Step 3: Perform a vector search using the RPC function to find the most relevant chunks.
-        * Step 4: Perform a hybrid search (combines vector + keyword search) using RPC function.
-        * Step 5: Perform multi-query vector search (generate multiple query variations and search)
-        * Step 6: Perform multi-query hybrid search (multiple queries with hybrid strategy)
-        * Step 7: Build the context from the retrieved chunks and format them into a structured context with citations.
-        """
+      
         # Step 1: Get user's project settings from the database.
         project_settings = get_project_settings(project_id)
 
@@ -114,6 +105,8 @@ def hybrid_search(query: str, document_ids: List[str], settings: dict) -> List[D
         [vector_results, keyword_results],
         [settings["vector_weight"], settings["keyword_weight"]],
     )
+
+
 
 
 def multi_query_vector_search(user_query, document_ids, project_settings):

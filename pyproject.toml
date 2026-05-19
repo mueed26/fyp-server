@@ -24,6 +24,8 @@ langchain-openai = "1.0.3"
 langchain-tavily = "0.2.13"
 langchain-anthropic = "^1.4.0"
 langchain-ollama = "^1.0.1"
+ragas = "^0.4.3"
+openai = "^2.30.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

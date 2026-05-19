@@ -14,30 +14,39 @@ from src.services.llm import openAI
 
 
 MIND_MAP_PROMPT = PromptTemplate.from_template("""
-You are an expert tutor. Your task is to create a **Mind Map** from the provided study guide
-that enhances students' understanding and retention of complex concepts.
+You are an expert tutor creating a DETAILED mind map for exam preparation.
 
-Follow these rules strictly:
-1. Return ONLY valid JSON in MindElixir format.
-2. Use short node names (1-5 words). Move long explanations into child nodes.
-3. Structure should have a root node with children, each child can have its own children (max 3 levels deep).
-4. Cover all major topics from the study guide.
-5. Do NOT include any text outside the JSON.
+Your task: Convert the study guide into a comprehensive MindElixir mind map.
 
-Required JSON structure:
+**RULES:**
+1. Return ONLY valid JSON in MindElixir format — no other text.
+2. Node names should be concise (1-7 words).
+3. Structure: root → main topics → subtopics → details (up to 4 levels deep).
+4. Cover EVERY major topic and subtopic from the study guide.
+5. Each main topic should have at least 3-5 children.
+6. Include key terms, definitions, examples, and relationships as leaf nodes.
+7. Aim for at least 30-50 total nodes to be comprehensive.
+
+**JSON structure:**
 {{
   "nodeData": {{
     "id": "root",
-    "topic": "<Main Topic>",
+    "topic": "<Main Subject>",
     "children": [
       {{
         "id": "<unique_id>",
-        "topic": "<Short Node Name>",
+        "topic": "<Major Topic>",
         "children": [
           {{
             "id": "<unique_id>",
             "topic": "<Subtopic>",
-            "children": []
+            "children": [
+              {{
+                "id": "<unique_id>",
+                "topic": "<Detail or Example>",
+                "children": []
+              }}
+            ]
           }}
         ]
       }}
@@ -45,35 +54,31 @@ Required JSON structure:
   }}
 }}
 
+**ID format:** Use simple unique IDs like "t1", "t1c1", "t1c1c1", "t2", "t2c1", etc.
+
 Study Guide:
 \"\"\"
 {study_guide_text}
 \"\"\"
 
-Output the Mind Map as JSON only, fully compatible with MindElixir.
+Output the Mind Map as JSON only.
 """)
 
 
 def generate_mind_map(study_guide: str) -> str:
     """
     Generate a MindElixir-compatible mind map JSON from a study guide.
-    
-    Args:
-        study_guide: The study guide text to convert into a mind map
-        
-    Returns:
-        JSON string of the mind map in MindElixir format
     """
     if not study_guide:
         return ""
-    
+
     llm = openAI["features_llm"]
-    
+
     messages = MIND_MAP_PROMPT.invoke({"study_guide_text": study_guide})
     response = llm.invoke(messages)
-    
+
     content = str(response.content).strip()
-    
+
     # Clean up markdown code fences if present
     if content.startswith("```json"):
         content = content[7:]
@@ -82,7 +87,7 @@ def generate_mind_map(study_guide: str) -> str:
     if content.endswith("```"):
         content = content[:-3]
     content = content.strip()
-    
+
     # Validate it's valid JSON
     try:
         parsed = json.loads(content)

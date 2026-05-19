@@ -41,7 +41,7 @@ def get_project_document_ids(project_id):
     except Exception as e:
         raise Exception(f"Failed to get document IDs: {str(e)}")
 
-
+#get docs and then get relevant docs in raw format 
 def build_context_from_retrieved_chunks(
     chunks: List[Dict],
 ) -> Tuple[List[str], List[str], List[str], List[Dict]]:
@@ -106,7 +106,7 @@ def build_context_from_retrieved_chunks(
 
     return texts, images, tables, citations
 
-
+#just prints the chunsk for ya
 def validate_context_from_retrieved_chunks(
     texts: List[str], images: List[str], tables: List[str], citations: List[Dict]
 ) -> None:
