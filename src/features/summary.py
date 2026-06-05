@@ -1,15 +1,19 @@
 """
 Summary Generation Pipeline - Exam Aware.
 
-- Generates exam-focused summaries when past year papers are available
-- Highlights topics that appeared in past exams
-- Covers both lecture content and exam-relevant material
+Consumes the exam linkage structure from cross_reference.py. Each linkage pairs
+a real lecture excerpt with the real past-year exam question that matched it, so
+the summary can point to exactly what was tested and how.
 """
 
 from typing import List, Dict, Optional
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from src.services.llm import openAI
+from src.features.cross_reference import format_linkages_for_prompt
+from src.config.logging import get_logger
+
+logger = get_logger(__name__)
 
 TOKEN_MAX = 4000
 
@@ -52,68 +56,65 @@ def _reduce(docs: List[Document]) -> str:
 
 def generate_summary(
     contents: List[str],
-    past_year_content: Optional[str] = None,
-    exam_relevant_topics: Optional[Dict[str, bool]] = None,
+    exam_linkages: Optional[Dict] = None,
 ) -> str:
     """
     Generate a summary from document content, optionally exam-focused.
-    
+
     Args:
         contents: List of text chunks from lecture notes
-        past_year_content: Combined text from past year papers (if available)
-        exam_relevant_topics: Dict of topic -> is_exam_relevant from RAG cross-referencing
+        exam_linkages: linkage structure from cross_reference.cross_reference_chunks(),
+            or None. Contains real lecture<->exam excerpt pairs with similarity scores.
     """
     if not contents:
         return ""
 
+    has_exam = bool(exam_linkages and exam_linkages.get("linkages"))
+    logger.info("generating_summary", chunk_count=len(contents), has_exam_linkages=has_exam)
+
     all_text = "\n\n".join(contents)
     llm = openAI["features_llm"]
 
-    # Exam-aware summary
-    if past_year_content and exam_relevant_topics:
-        exam_topics = [t for t, relevant in exam_relevant_topics.items() if relevant]
-        non_exam_topics = [t for t, relevant in exam_relevant_topics.items() if not relevant]
+    # -- Exam-aware summary --------------------------------------------------
+    if has_exam:
+        linkage_block = format_linkages_for_prompt(exam_linkages)
+        coverage_pct = int(exam_linkages["exam_coverage_score"] * 100)
+        logger.info("exam_aware_summary_started", coverage_pct=coverage_pct,
+                    linkages=len(exam_linkages["linkages"]))
 
         prompt = ChatPromptTemplate.from_messages([
             ("user",
-             "You are an expert tutor creating an **exam-focused study summary** for students.\n\n"
+             "You are an expert tutor creating an **exam-focused study summary**.\n\n"
              "=== LECTURE NOTES ===\n{lecture_content}\n\n"
-             "=== PAST YEAR EXAMINATION PAPER ===\n{past_year_content}\n\n"
-             "=== TOPICS THAT APPEARED IN PAST EXAMS (identified via semantic matching) ===\n"
-             "{exam_topics}\n\n"
-             "=== TOPICS NOT YET TESTED IN EXAMS ===\n"
-             "{non_exam_topics}\n\n"
+             "=== EXAM LINKAGES ===\n"
+             "Below are lecture sections paired with the ACTUAL past-year exam "
+             "questions they matched (via semantic similarity). Higher similarity "
+             "= this lecture content was tested more directly.\n\n"
+             "{linkage_block}\n\n"
              "**Instructions:**\n"
-             "- Create a comprehensive, detailed summary in **Markdown format**\n"
-             "- Start with an **Exam Focus** section listing the most frequently tested topics\n"
-             "- For each major topic, use ## headings\n"
-             "- Mark topics that appeared in past exams with ⭐ in the heading\n"
-             "- Only reference past year questions that relate to the lecture notes content\n"
-             "- Ignore past year questions about topics not covered in the notes\n"
-             "- Include key definitions, formulas, and concepts\n"
-             "- Use bullet points (-) for key points\n"
-             "- Use **bold** for important terms\n"
-             "- End with a **Predicted Important Topics** section for potential exam questions\n"
-             "- Be EXTREMELY thorough and detailed — aim for at least 2000 words\n"
-             "- Structure in TWO main parts:\n"
-             "  **Part 1: Comprehensive Summary** — detailed coverage of ALL lecture topics\n"
-             "  **Part 2: Exam Focus** — topics that appeared in past exams with extra detail and exam tips\n"
-             "- Include definitions, examples, formulas, and relationships between concepts\n"
-             "- For exam topics, explain WHY they're important and HOW they might be tested\n"
-             
-             )
+             "- Comprehensive, detailed summary in **Markdown format**\n"
+             "- Begin with an **Exam Focus** section: list the highest-similarity "
+             "linked topics first, and for each, note what the past exam actually asked\n"
+             "- Mark heavily-tested topics with up to 3 stars based on similarity\n"
+             "- Use ## headings per major topic; bullet points (-) for key points; "
+             "**bold** for important terms\n"
+             "- End with **Predicted Important Topics** drawn from the linkages\n"
+             "- Be thorough - aim for at least 2000 words\n"
+             "- Two parts:\n"
+             "  **Part 1: Comprehensive Summary** - all lecture topics\n"
+             "  **Part 2: Exam Focus** - the linked topics with extra detail, "
+             "explaining HOW each was tested and HOW it might be tested again\n")
         ])
 
         response = llm.invoke(prompt.invoke({
             "lecture_content": all_text[:15000],
-            "past_year_content": past_year_content[:10000],
-            "exam_topics": "\n".join(f"- {t}" for t in exam_topics) if exam_topics else "None identified",
-            "non_exam_topics": "\n".join(f"- {t}" for t in non_exam_topics) if non_exam_topics else "None",
+            "linkage_block": linkage_block,
         }))
+        result = str(response.content)
+        logger.info("exam_aware_summary_completed", result_length=len(result))
+        return result
 
-        return str(response.content)
-
-    # Standard summary (no past year paper)
+    # -- Standard summary (no past year paper) -------------------------------
     if len(contents) <= 80:
         prompt = ChatPromptTemplate.from_messages([
             ("user",
@@ -124,18 +125,19 @@ def generate_summary(
              "- Use bullet points (-) for key points\n"
              "- Emphasize important terms with **bold**\n"
              "- Include key definitions, formulas, examples where relevant\n"
-             "- Be EXTREMELY thorough and detailed — this is the student's PRIMARY study resource\n"
+             "- Be EXTREMELY thorough - this is the student's PRIMARY study resource\n"
              "- Aim for at least 1500-2000 words\n"
-             "- Cover EVERY major topic with full explanations, not just bullet points\n"
-             "- Include definitions, examples, formulas, and relationships between concepts\n\n"
-
-             
+             "- Cover EVERY major topic with full explanations\n"
+             "- Include definitions, examples, formulas, relationships between concepts\n\n"
              "Content:\n{content}")
         ])
         response = llm.invoke(prompt.invoke({"content": all_text}))
-        return str(response.content)
+        result = str(response.content)
+        logger.info("standard_summary_completed", result_length=len(result))
+        return result
 
-    # Large document: map/reduce
+    # -- Large document: map / reduce ----------------------------------------
+    logger.info("large_document_map_reduce_started", chunk_count=len(contents))
     map_prompt = ChatPromptTemplate.from_messages([
         ("user", "Write a detailed summary of the following:\n\n{context}")
     ])
@@ -146,9 +148,10 @@ def generate_summary(
         summaries.append(str(response.content))
 
     collapsed = [Document(page_content=s) for s in summaries]
-
     while _length_function(collapsed) > TOKEN_MAX:
         batches = _split_list_of_docs(collapsed, TOKEN_MAX)
         collapsed = [Document(page_content=_reduce(batch)) for batch in batches]
 
-    return _reduce(collapsed)
+    result = _reduce(collapsed)
+    logger.info("map_reduce_summary_completed", result_length=len(result))
+    return result

@@ -1,8 +1,3 @@
-#The supervisor agent acts as a coordinator with two specialized sub-agents: a RAG agent for internal document search and a web search agent using Tavily or DuckDuckGo. The supervisor's system prompt contains routing rules
-
-# two tools insetad of one simple rag search and then we search 
-
-#The routing bias is intentional: RAG is always preferred over web search. The supervisor only calls web search when the user explicitly asks for external information.
 """
 Complete LangGraph Multi-Agent Supervisor Implementation
 
@@ -226,8 +221,6 @@ For all other queries, you MUST route to the appropriate agent(s) and synthesize
 # RAG AGENT
 # =============================================================================
 
-
-#calls retreival pipeline then calls llm and updates messages and citations
 def create_rag_tool(project_id: str):
     """
     Create a RAG search tool bound to a specific project.
@@ -448,7 +441,22 @@ def create_supervisor_tools(project_id: str, model: str = "gpt-4o"):
         query: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
     ) -> Command:
-    
+        """Search internal project documents using RAG.
+        
+        Use this when the user asks about:
+        - Project-specific information
+        - Internal documentation
+        - Previously uploaded files and documents
+        - Company/project-specific data
+        - Technical specifications from project files
+        
+        Args:
+            query: Natural language query about project documents
+            tool_call_id: Injected tool call ID for message tracking
+            
+        Returns:
+            Command with relevant information from project documents and citations
+        """
         result = rag_agent.invoke({
             "messages": [{"role": "user", "content": query}]
         })
@@ -631,10 +639,10 @@ def create_supervisor_agent(
     workflow = StateGraph(CustomAgentState)
     
     # Add nodes
-    # workflow.add_node("guardrail", guardrail_node)
+    workflow.add_node("guardrail", guardrail_node)
     workflow.add_node("supervisor", base_supervisor)
     
-    # # Add edges
+    # Add edges
     workflow.add_edge(START, "guardrail")
     workflow.add_conditional_edges(
         "guardrail",
@@ -644,7 +652,6 @@ def create_supervisor_agent(
             "__end__": END
         }
     )
-    workflow.add_edge(START, "supervisor")
     workflow.add_edge("supervisor", END)
     
     # Compile and return

@@ -69,3 +69,37 @@ class InputGuardrailCheck(BaseModel):
     is_prompt_injection: bool = Field(description="Appears to be a prompt injection attempt")
     contains_pii: bool = Field(description="Contains personal identifiable information")
     reason: str = Field(description="Brief explanation if unsafe, empty string if safe")
+
+
+# =============================================================================
+# FEATURE GENERATION MODELS
+# =============================================================================
+# Centralised so the route, orchestrator, and any future caller share ONE source
+# of truth for valid feature types and document tags - no more magic strings.
+
+class SourceTag(str, Enum):
+    """How a document is classified for cross-referencing. Set at/before upload."""
+    LECTURE_NOTES = "lecture_notes"
+    PAST_YEAR_PAPER = "past_year_paper"
+
+
+class FeatureType(str, Enum):
+    """The studio features the app can generate."""
+    SUMMARY = "summary"
+    FLASHCARDS = "flashcards"
+    PRACTICE_QUESTIONS = "practice_questions"
+    MIND_MAP = "mind_map"
+
+
+class FeatureGenerateRequest(BaseModel):
+    doc_ids: List[str] = Field(..., description="List of document IDs")
+    feature_type: FeatureType = Field(..., description="One of: summary, flashcards, practice_questions, mind_map")
+
+
+class FeatureMergeRequest(BaseModel):
+    doc_ids: List[str] = Field(..., description="List of document IDs to merge features from")
+    source_type: FeatureType = Field(..., description="One of: summary, flashcards, practice_questions, mind_map")
+
+
+class DocumentTagRequest(BaseModel):
+    source_tag: SourceTag = Field(..., description="Either 'lecture_notes' or 'past_year_paper'")

@@ -1,9 +1,13 @@
-from src.services.supabase import supabase
+
 import os
 import time
+import tempfile
+
+from src.services.supabase import supabase
 from src.services.llm import openAI
 from src.services.awsS3 import s3_client
 from src.config.index import appConfig
+from src.config.logging import get_logger
 from src.rag.ingestion.utils import (
     partition_document,
     analyze_elements,
@@ -11,29 +15,30 @@ from src.rag.ingestion.utils import (
     get_page_number,
     create_ai_summary,
 )
-
-#unstructure uses poppler to extract text images and tables 
-#tessaract optical character recognition(ocr) for scanned documents
-#libmagic to analyse file type and file content
 from src.models.index import ProcessingStatus
 from unstructured.chunking.title import chunk_by_title
 from src.services.webScrapper import scrapingbee_client
-import tempfile
+
+logger = get_logger(__name__)
 
 
-#entry point for the celetry worker.. mark status as processing and then fetch documnet record  from supabase to get s3 key and filename
-def process_document(document_id: str):
+# ─────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────
+
+def process_document(document_id: str) -> dict:
     """
-    * Step 1 : Download from S3 (file) or Crawl the URL (url) and Extract text, tables, and images from the PDF (using Unstructured Library) from the AWS S3 document.
-    * Step 2 : Split the extracted content into chunks.
-    * Step 3 : Generate AI summaries for each chunk.
-    * Step 4 : Create vector embeddings of chunk and store in PostgreSQL.
-    * Update the project document record with the processing_status and processing_details as needed.
-    *   - `processing_details` : What type of elements or metadata did we retrieve from the document to show in the UI.
+    Full ingestion pipeline for a single document:
+
+    Step 1 – Download from S3 (file) or crawl the URL, then partition into elements.
+    Step 2 – Chunk elements by title structure.
+    Step 3 – AI-summarise chunks that contain tables or images.
+    Step 4 – Vectorise chunk content and store in the database.
+
+    `processing_details` on the project_documents record is updated at each
+    stage so the frontend can show live progress.
     """
-
-
-#changes status once partition, chunking etc is done
+    logger.info("process_document_started", document_id=document_id)
     try:
         update_status_in_database(document_id, ProcessingStatus.PROCESSING)
 
@@ -44,88 +49,82 @@ def process_document(document_id: str):
             .execute()
         )
         if not document_result.data:
-            raise Exception(
-                f"Failed to get project document record with id: {document_id}"
-            )
-        document = document_result.data[0]
+            raise Exception(f"No project_document record found for id: {document_id}")
 
-        # Step 1 : Download from S3 (file) or Crawl the URL (url) and Extract content.
-        update_status_in_database(document_id, ProcessingStatus.PARTITIONING)
-        elements_summary, elements = download_content_and_partition(
-            document_id, document
+        document = document_result.data[0]
+        logger.info(
+            "document_record_retrieved",
+            document_id=document_id,
+            filename=document.get("filename"),
+            source_type=document.get("source_type"),
         )
+
+        # Step 1 – Partition
+        update_status_in_database(document_id, ProcessingStatus.PARTITIONING)
+        elements_summary, elements = download_content_and_partition(document_id, document)
+        logger.info("partitioning_complete", document_id=document_id, summary=elements_summary)
 
         update_status_in_database(
             document_id,
             ProcessingStatus.CHUNKING,
-            {
-                # Storing the partitioning result to showcase in the UI.
-                ProcessingStatus.PARTITIONING.value: {
-                    "elements_found": elements_summary,
-                }
-            },
+            {ProcessingStatus.PARTITIONING.value: {"elements_found": elements_summary}},
         )
 
-        # Step 2 : Split the extracted content into chunks.
+        # Step 2 – Chunk
+        source_type = document.get("source_type", "file")
         chunks, chunking_metrics = chunk_elements_by_title(elements)
+        logger.info("chunking_complete", document_id=document_id, metrics=chunking_metrics)
+
         update_status_in_database(
             document_id,
             ProcessingStatus.SUMMARISING,
-            {
-                # Storing the chunking result to showcase in the UI.
-                ProcessingStatus.CHUNKING.value: chunking_metrics,
-            },
+            {ProcessingStatus.CHUNKING.value: chunking_metrics},
         )
 
-        # Step 3 : Generate AI summaries for chunk which are Having images and tables.
-        processed_chunks = summarise_chunks(chunks, document_id)
+        # Step 3 – Summarise
+        processed_chunks = summarise_chunks(chunks, document_id, source_type=source_type)
         update_status_in_database(document_id, ProcessingStatus.VECTORIZATION)
 
-        # Step 4 : Create vector embeddings (1536 dimensions per chunk).
+        # Step 4 – Vectorise & store
         vectorize_chunks_summary_and_store_in_database(processed_chunks, document_id)
-
         update_status_in_database(document_id, ProcessingStatus.COMPLETED)
 
-        return {
-            "success": True,
-            "document_id": document_id,
-        }
+        logger.info("process_document_completed", document_id=document_id)
+        return {"success": True, "document_id": document_id}
+
     except Exception as e:
+        logger.error(
+            "process_document_failed",
+            document_id=document_id,
+            error=str(e),
+            exc_info=True,
+        )
         raise Exception(f"Failed to process document {document_id}: {str(e)}")
 
 
+# ─────────────────────────────────────────────
+#  Database helpers
+# ─────────────────────────────────────────────
+
 def update_status_in_database(
     document_id: str, status: ProcessingStatus, details: dict = None
-):
-    """
-    Update the project document record with the new status and details.
-    """
+) -> None:
+    """Merge `details` into processing_details and set the new status."""
     try:
-        # Get the project document record
-        document_result = (
+        result = (
             supabase.table("project_documents")
             .select("processing_details")
             .eq("id", document_id)
             .execute()
         )
-        if not document_result.data:
-            raise Exception(
-                f"Failed to get project document record with id: {document_id}"
-            )
+        if not result.data:
+            raise Exception(f"No project_document record found for id: {document_id}")
 
-        # Add processing details to the project document record if there are any
-        current_details = {}
-        if document_result.data[0]["processing_details"]:
-            current_details = document_result.data[0]["processing_details"]
-
-        # Add new details if provided
+        current_details = result.data[0]["processing_details"] or {}
         if details:
-            current_details.update(
-                details
-            )  # Note : update() - built-in dict method that merges another dictionary into the current one.
+            current_details.update(details)
 
-        # Update the project document record with the new details
-        document_update_result = (
+        update_result = (
             supabase.table("project_documents")
             .update(
                 {
@@ -136,58 +135,70 @@ def update_status_in_database(
             .eq("id", document_id)
             .execute()
         )
-
-        if not document_update_result.data:
+        if not update_result.data:
             raise Exception(
-                f"Failed to update project document record with id: {document_id}"
+                f"Update returned no data for document_id: {document_id}"
             )
 
     except Exception as e:
         raise Exception(f"Failed to update status in database: {str(e)}")
 
 
-import tempfile
+# ─────────────────────────────────────────────
+#  Step 1 – Download & Partition
+# ─────────────────────────────────────────────
 
-def download_content_and_partition(document_id: str, document: dict):
+def download_content_and_partition(document_id: str, document: dict) -> tuple:
     """
-    Content either a file or a url.
-    if :  Document - Download from S3
-    else : URL - Crawl the URL
-    Partition into elements like text, tables, images, etc. and analyze the elements summary and upload to db.
+    Download the document from S3 (or crawl a URL), write it to a temp file,
+    partition it into unstructured elements, then clean up the temp file.
+    Returns (elements_summary, elements).
     """
     try:
-        document_source_type = document["source_type"]
-        elements = None
+        source_type = document["source_type"]
         temp_file_path = None
-        
-        if document_source_type == "file":
+
+        if source_type == "file":
             s3_key = document["s3_key"]
             filename = document["filename"]
-            file_type = filename.split(".")[-1].lower()
-
-            # Use system temp directory - works on Windows, Mac, Linux
-            temp_dir = tempfile.gettempdir()
-            temp_file_path = os.path.join(temp_dir, f"{document_id}.{file_type}")
-            
-            s3_client.download_file(appConfig["s3_bucket_name"], s3_key, temp_file_path)
+            file_type = filename.rsplit(".", 1)[-1].lower()
+            temp_file_path = os.path.join(
+                tempfile.gettempdir(), f"{document_id}.{file_type}"
+            )
+            logger.info(
+                "downloading_from_s3",
+                document_id=document_id,
+                s3_key=s3_key,
+                temp_file=temp_file_path,
+            )
+            s3_client.download_file(
+                appConfig["s3_bucket_name"], s3_key, temp_file_path
+            )
             elements = partition_document(temp_file_path, file_type)
 
-        if document_source_type == "url":
+        elif source_type == "url":
             url = document["source_url"]
+            temp_file_path = os.path.join(
+                tempfile.gettempdir(), f"{document_id}.html"
+            )
+            logger.info(
+                "crawling_url", document_id=document_id, url=url, temp_file=temp_file_path
+            )
             response = scrapingbee_client.get(url)
-            
-            # Use system temp directory
-            temp_dir = tempfile.gettempdir()
-            temp_file_path = os.path.join(temp_dir, f"{document_id}.html")
-            
             with open(temp_file_path, "wb") as f:
                 f.write(response.content)
-
             elements = partition_document(temp_file_path, "html", source_type="url")
+
+        else:
+            raise ValueError(f"Unknown source_type: {source_type}")
 
         elements_summary = analyze_elements(elements)
         os.remove(temp_file_path)
-
+        logger.info(
+            "download_and_partition_done",
+            document_id=document_id,
+            elements_summary=elements_summary,
+        )
         return elements_summary, elements
 
     except Exception as e:
@@ -195,41 +206,202 @@ def download_content_and_partition(document_id: str, document: dict):
             f"Failed in Step 1 to download content and partition elements: {str(e)}"
         )
 
-def chunk_elements_by_title(elements):
+
+# ─────────────────────────────────────────────
+#  Step 2 – Chunk
+# ─────────────────────────────────────────────
+
+def chunk_elements_by_title(elements: list) -> tuple:
+    """
+    Chunk elements by title structure, then ensure images end up in the
+    chunk that matches their page number (chunk_by_title can misplace or
+    drop image elements).
+    Returns (chunks, chunking_metrics).
+    """
     try:
-        chunks = chunk_by_title(
-            elements,  # The parsed PDF elements from previous step
-            max_characters=3000,  # Hard limit - never exceed 3000 characters per chunk
-            new_after_n_chars=2400,  # Try to start a new chunk after 2400 characters
-            combine_text_under_n_chars=500,  # Merge tiny chunks under 500 chars with neighbors
+        all_image_elements = [el for el in elements if type(el).__name__ == "Image"]
+        logger.info(
+            "chunking_started",
+            total_elements=len(elements),
+            image_elements=len(all_image_elements),
         )
 
-        # Collect chunking metrics
-        total_chunks = len(chunks)
+        chunks = chunk_by_title(
+            elements,
+            max_characters=3000,
+            new_after_n_chars=2400,
+            combine_text_under_n_chars=500,
+        )
+        logger.info("chunk_by_title_done", chunk_count=len(chunks))
 
-        chunking_metrics = {"total_chunks": total_chunks}
+        chunks, placement_stats = _ensure_images_in_correct_chunks(
+            chunks, all_image_elements
+        )
 
+        chunks_with_images = sum(
+            1
+            for c in chunks
+            if any(
+                type(e).__name__ == "Image"
+                for e in (
+                    getattr(getattr(c, "metadata", None), "orig_elements", None) or []
+                )
+            )
+        )
+
+        chunking_metrics = {
+            "total_chunks": len(chunks),
+            "chunks_with_images": chunks_with_images,
+            "images_relocated": placement_stats["images_relocated"],
+            "images_recovered": placement_stats["images_recovered"],
+        }
+        logger.info("chunking_metrics", **chunking_metrics)
         return chunks, chunking_metrics
+
     except Exception as e:
+        logger.error("chunking_failed", error=str(e), exc_info=True)
         raise Exception(f"Failed to chunk elements by title: {str(e)}")
 
 
-def summarise_chunks(chunks, document_id, source_type="file"):
+def _ensure_images_in_correct_chunks(chunks: list, all_image_elements: list) -> tuple:
     """
-    Create user-friendly, searchable chunks.
-
-    For each chunk we optionally generate an AI summary (useful for mixed content like
-    tables/images) and update the UI to better UX as each chunk will take at least 5 seconds to process.
+    Post-process chunks to fix image placement:
+    - Remove images that landed in the wrong page's chunk (misplaced).
+    - Detect images that chunk_by_title dropped entirely (missing).
+    - Re-attach both sets to the chunk whose page number best matches the image.
     """
+    stats = {"images_relocated": 0, "images_recovered": 0}
+    if not all_image_elements or not chunks:
+        return chunks, stats
 
+    # Index original images by base64 hash for fast lookup
+    original_b64s: dict = {}
+    for img in all_image_elements:
+        b64 = getattr(getattr(img, "metadata", None), "image_base64", None)
+        if b64:
+            original_b64s[b64] = img
+
+    if not original_b64s:
+        return chunks, stats
+
+    correctly_placed_b64s: set = set()
+    misplaced: list = []
+
+    for chunk in chunks:
+        orig = getattr(getattr(chunk, "metadata", None), "orig_elements", None)
+        if not orig:
+            continue
+        chunk_page = getattr(chunk.metadata, "page_number", None)
+        is_tuple = isinstance(orig, tuple)
+        kept: list = []
+
+        for el in orig:
+            if type(el).__name__ != "Image":
+                kept.append(el)
+                continue
+            b64 = getattr(getattr(el, "metadata", None), "image_base64", None)
+            if not b64 or b64 not in original_b64s:
+                kept.append(el)
+                continue
+            img_page = getattr(el.metadata, "page_number", None)
+            if img_page is None or chunk_page is None or img_page == chunk_page:
+                kept.append(el)
+                correctly_placed_b64s.add(b64)
+            else:
+                misplaced.append(el)
+
+        chunk.metadata.orig_elements = tuple(kept) if is_tuple else kept
+
+    # Images that never appeared in any chunk at all
+    missing: list = [
+        img
+        for b64, img in original_b64s.items()
+        if b64 not in correctly_placed_b64s
+        and not any(
+            getattr(getattr(m, "metadata", None), "image_base64", None) == b64
+            for m in misplaced
+        )
+    ]
+
+    stats["images_relocated"] = len(misplaced)
+    stats["images_recovered"] = len(missing)
+
+    logger.info(
+        "image_placement_check",
+        correctly_placed=len(correctly_placed_b64s),
+        misplaced=len(misplaced),
+        missing=len(missing),
+    )
+
+    for img in misplaced + missing:
+        img_page = getattr(getattr(img, "metadata", None), "page_number", None)
+        target = _find_best_chunk_for_image(chunks, img_page)
+        if target:
+            _attach_element_to_chunk(target, img)
+            logger.debug(
+                "image_reattached",
+                img_page=img_page,
+                chunk_page=getattr(getattr(target, "metadata", None), "page_number", None),
+            )
+
+    return chunks, stats
+
+
+def _find_best_chunk_for_image(chunks: list, image_page_number):
+    """Return the chunk whose page number is closest to `image_page_number`."""
+    if not chunks:
+        return None
+    if image_page_number is None:
+        return chunks[0]
+
+    exact = None
+    closest = None
+    closest_diff = float("inf")
+
+    for chunk in chunks:
+        chunk_page = getattr(getattr(chunk, "metadata", None), "page_number", None)
+        if chunk_page is None:
+            continue
+        if chunk_page == image_page_number:
+            exact = chunk
+            break
+        diff = abs(chunk_page - image_page_number)
+        if diff < closest_diff:
+            closest_diff = diff
+            closest = chunk
+
+    return exact or closest or chunks[0]
+
+
+def _attach_element_to_chunk(chunk, element) -> None:
+    """Append `element` to chunk.metadata.orig_elements (handles tuple or list)."""
+    if not hasattr(chunk, "metadata") or chunk.metadata is None:
+        return
+    current = getattr(chunk.metadata, "orig_elements", None)
+    if current is None:
+        current = []
+    elif isinstance(current, tuple):
+        current = list(current)
+    current.append(element)
+    chunk.metadata.orig_elements = current
+
+
+# ─────────────────────────────────────────────
+#  Step 3 – Summarise
+# ─────────────────────────────────────────────
+
+def summarise_chunks(chunks: list, document_id: str, source_type: str = "file") -> list:
+    """
+    Iterate over chunks.  For each chunk that contains tables or images,
+    call the LLM to produce a richer searchable summary.  Plain text chunks
+    pass through unchanged.
+    """
     try:
         processed_chunks = []
         total_chunks = len(chunks)
 
         for i, chunk in enumerate(chunks):
             current_chunk = i + 1
-
-            # Progress updates for the UI polling loop; keeps the user informed.
             update_status_in_database(
                 document_id,
                 ProcessingStatus.SUMMARISING,
@@ -237,143 +409,123 @@ def summarise_chunks(chunks, document_id, source_type="file"):
                     ProcessingStatus.SUMMARISING.value: {
                         "current_chunk": current_chunk,
                         "total_chunks": total_chunks,
-                    },
+                    }
                 },
             )
 
-            # Normalize the raw chunk into typed content buckets (text/tables/images, etc.).
-            # content_data = {
-            #     "text": "This is the main text content of the chunk...",
-            #     "tables": ["<table><tr><th>Header</th></tr><tr><td>Data</td></tr></table>"],
-            #     "images": ["iVBORw0KGgoAAAANSUhEUgAA..."],  # base64 encoded image strings
-            #     "types": ["text", "table", "image"]  # or ["text"], ["text", "table"], etc.
-            # }
             content_data = separate_content_types(chunk, source_type)
 
-            # * Use AI summarization only when the chunk contains at least one table or image.
-            if content_data["tables"] or content_data["images"]:
+            if content_data["images"] or content_data["tables"]:
+                logger.info(
+                    "chunk_has_rich_content",
+                    chunk=f"{current_chunk}/{total_chunks}",
+                    images=len(content_data["images"]),
+                    tables=len(content_data["tables"]),
+                )
                 enhanced_content = create_ai_summary(
-                    content_data["text"], content_data["tables"], content_data["images"]
+                    content_data["text"],
+                    content_data["tables"],
+                    content_data["images"],
                 )
             else:
                 enhanced_content = content_data["text"]
 
-            # Preserve the original content structure for traceability in the UI.
-            original_content = {"text": content_data["text"]}
+            original_content: dict = {"text": content_data["text"]}
             if content_data["tables"]:
                 original_content["tables"] = content_data["tables"]
             if content_data["images"]:
                 original_content["images"] = content_data["images"]
 
-            # Assemble the final searchable unit with minimal but useful metadata.
-            processed_chunk = {
-                "content": enhanced_content,
-                "original_content": original_content,
-                "type": content_data["types"],
-                "page_number": get_page_number(chunk, i),
-                "char_count": len(enhanced_content),
-            }
+            processed_chunks.append(
+                {
+                    "content": enhanced_content,
+                    "original_content": original_content,
+                    "type": content_data["types"],
+                    "page_number": get_page_number(chunk, i),
+                    "char_count": len(enhanced_content),
+                }
+            )
 
-            # Rough example for processed_chunk:
-            # {
-            #     "content": "AI-enhanced summary of the chunk... Image looks like this: <image_base64> ... Table looks like this: <table_html> ...",
-            #     "original_content": {
-            #         "text": "Full paragraph of the chunk...",
-            #         "tables": ["<table><tr><th>Region</th><th>Revenue</th></tr><tr><td>APAC</td><td>$1.2M</td></tr></table>"],
-            #         "images": ["iVBORw0KGgoAAA...base64..."]
-            #     },
-            #     "type": ["text", "table", "image"],
-            #     "page_number": 3,
-            #     "char_count": 142
-            # }
-
-            processed_chunks.append(processed_chunk)
-
+        logger.info(
+            "summarisation_complete",
+            document_id=document_id,
+            total_chunks=total_chunks,
+        )
         return processed_chunks
+
     except Exception as e:
         raise Exception(f"Failed to summarise chunks: {str(e)}")
 
 
-def vectorize_chunks_summary_and_store_in_database(processed_chunks, document_id):
-    """Generate vector embeddings of the ai-summary of the chunks and store in the database."""
+# ─────────────────────────────────────────────
+#  Step 4 – Vectorise & store
+# ─────────────────────────────────────────────
 
+def vectorize_chunks_summary_and_store_in_database(
+    processed_chunks: list, document_id: str
+) -> list:
+    """
+    Embed each chunk's content string (AI summary or raw text) in batches of 10,
+    then insert each chunk + its embedding vector into document_chunks.
+    Returns the list of stored chunk IDs.
+    """
     try:
-        # processed_chunks example (list of dicts):
-
-        # processed chunks = [{
-        #     "content": "Ai-enhanced summary of the chunk...", <----- **This is the content that will be vectorized.**
-        #     "original_content": {"text": "...", "tables": ["<table...>"], "images": ["<base64>"]},
-        #     "type": ["text", "table", "image"],
-        #     "page_number": 3,
-        #     "char_count": 142
-        # }, {....}]
-        # Step 1 : Vectorizing Chunks
         ai_summary_list = [chunk["content"] for chunk in processed_chunks]
-        # ai_summary_list = ["Ai-enhanced summary of the chunk...", "Ai-enhanced summary of the chunk...", ...]
-
-        # Edge case : More chunks < More API calls. In Case we exceed the API limit. We will generate in batches.
         batch_size = 10
-        all_vectorized_embeddings = []
+        all_embeddings: list = []
 
         for start in range(0, len(ai_summary_list), batch_size):
-
-            # Splits into chunks of batch_size - 10
-            end = start + batch_size
-            batch_texts = ai_summary_list[start:end]  # We get the chunks of 10 or less.
-
-            # Simple retry with exponential backoff
+            batch = ai_summary_list[start: start + batch_size]
             attempt = 0
             while True:
                 try:
-                    embeddings = openAI["embeddings"].embed_documents(batch_texts)
-                    # As
-                    all_vectorized_embeddings.extend(
-                        embeddings
-                    )  # 'extend' - built-in list method that adds multiple elements to the end of the list.
+                    embeddings = openAI["embeddings"].embed_documents(batch)
+                    all_embeddings.extend(embeddings)
+                    logger.debug(
+                        "batch_embedded",
+                        batch_start=start,
+                        batch_size=len(batch),
+                    )
                     break
                 except Exception as e:
                     attempt += 1
                     if attempt >= 3:
                         raise e
-                    time.sleep(2**attempt)
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "embedding_retry",
+                        attempt=attempt,
+                        wait_seconds=wait,
+                        error=str(e),
+                    )
+                    time.sleep(wait)
 
-        # Step 2 : Storing Chunks with Embeddings
-        # chunk_embedding_pairs: list of tuples (processed_chunk, embedding_vector)
-        # Example:
-        # [
-        #     ({"content": "...", "page_number": 1, "type": ["text"]}, [0.123, -0.456, 0.789, ...]),
-        #     ({"content": "...", "page_number": 2, "type": ["text", "table"]}, [0.234, -0.567, 0.890, ...]),
-        #     ...
-        # ]
-        chunk_embedding_pairs = list(zip(processed_chunks, all_vectorized_embeddings))
-        stored_chunk_ids = []
-
-        for i, (processed_chunk, embedding_vector) in enumerate(chunk_embedding_pairs):
-            # Add document_id, chunk_index, and embedding to each processed_chunk
-            # chunk_data_with_embedding example:
-            # {
-            #     * Same as above but added document_id, chunk_index, and embedding.
-            #     "content": "AI-enhanced summary of the chunk...","original_content": {"text": "...", "tables": ["<table>...</table>"], "images": ["<base64>"]},"type": ["text", "table", "image"],"page_number": 3,"char_count": 142,
-            #     "document_id": "doc_123",
-            #     "chunk_index": 0,
-            #     "embedding": [0.123, -0.456, 0.789, 0.234, ...]  # 1536 dimensions
-            # }
-            chunk_data_with_embedding = {
-                **processed_chunk,
-                "document_id": document_id,
-                "chunk_index": i,
-                "embedding": embedding_vector,
-            }
-
+        stored_chunk_ids: list = []
+        for i, (chunk, embedding_vector) in enumerate(
+            zip(processed_chunks, all_embeddings)
+        ):
             result = (
                 supabase.table("document_chunks")
-                .insert(chunk_data_with_embedding)
+                .insert(
+                    {
+                        **chunk,
+                        "document_id": document_id,
+                        "chunk_index": i,
+                        "embedding": embedding_vector,
+                    }
+                )
                 .execute()
             )
             stored_chunk_ids.append(result.data[0]["id"])
 
-        # print(f"Successfully stored {len(processed_chunks)} chunks with embeddings")
+        logger.info(
+            "vectorization_complete",
+            document_id=document_id,
+            chunks_stored=len(stored_chunk_ids),
+        )
         return stored_chunk_ids
 
     except Exception as e:
-        raise Exception(f"Failed to vectorize chunks and store in database: {str(e)}")
+        raise Exception(
+            f"Failed to vectorize chunks and store in database: {str(e)}"
+        )
