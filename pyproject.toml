@@ -28,6 +28,7 @@ ragas = "^0.4.3"
 openai = "^2.30.0"
 structlog = "^25.5.0"
 numpy = "^2.4.6"
+stripe = "^15.2.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

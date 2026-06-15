@@ -7243,6 +7243,25 @@ files = [
 python-dateutil = ">=2.6.0"
 
 [[package]]
+name = "stripe"
+version = "15.2.0"
+description = "Python bindings for the Stripe API"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "stripe-15.2.0-py3-none-any.whl", hash = "sha256:e74d45bb07bb912fdc4ce81ffbdf184bcb92ce6e210cb7939966e537021c1842"},
+    {file = "stripe-15.2.0.tar.gz", hash = "sha256:f795d8a8ff27433e9ab03099afc0f5c4e992a8a6f92b9f839dc0048bb12f76f6"},
+]
+
+[package.dependencies]
+requests = ">=2.20"
+typing_extensions = ">=4.7.0"
+
+[package.extras]
+async = ["httpx"]
+
+[[package]]
 name = "structlog"
 version = "25.5.0"
 description = "Structured Logging for Python"
@@ -8840,4 +8859,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<4.0"
-content-hash = "f265b55f614f52d7be081e28411d757cf2471d07f6ab7c1307ece37d486e4f69"
+content-hash = "bc8b16329c108fe1f259d53c01e0e13789bbce2472d9d2ccd14375e6dd06de29"

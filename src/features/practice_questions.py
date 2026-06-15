@@ -35,22 +35,27 @@ def _parse_json_response(content: str) -> Optional[dict]:
         return None
 
 
-def _generate_past_year_questions(llm, lecture_content: str, linkage_block: str, matched_exam_text: str) -> dict:
+def _generate_past_year_questions(llm, lecture_content: str, linkage_block: str, matched_exam_text: str, linkage_count: int) -> dict:
     """Call 1: recreate the real past-year questions surfaced in the linkages."""
     prompt = ChatPromptTemplate.from_messages([
         ("user",
-         "You are an expert examiner. Recreate the past-year exam questions that "
-         "are relevant to these lecture notes, using the linkages below.\n\n"
+         "You are an expert examiner. Your job is to RECREATE every past-year exam "
+         "question that is relevant to the lecture notes below.\n\n"
          "=== LECTURE NOTES ===\n{lecture_content}\n\n"
          "=== EXAM LINKAGES (lecture content paired with the real exam questions it matched) ===\n"
          "{linkage_block}\n\n"
          "=== RAW MATCHED EXAM EXCERPTS ===\n{matched_exam_text}\n\n"
+         "**MANDATORY OUTPUT REQUIREMENTS:**\n"
+         "- You MUST produce AT LEAST {min_questions} questions across all categories combined\n"
+         "- EVERY linkage above should produce at least 1 question — aim for 1-2 per linkage\n"
+         "- Distinct linkages may share an exam excerpt — that's fine, derive multiple "
+         "questions from the same excerpt if it covers multiple sub-topics\n"
+         "- Set is_past_year: TRUE for EVERY question in this batch (no exceptions)\n\n"
          "**RULES:**\n"
-         "- Recreate EVERY distinct exam question represented in the linkages\n"
+         "- Recreate each distinct exam question you can identify from the linkages\n"
          "- Do NOT invent questions about topics absent from the lecture notes\n"
-         "- Set is_past_year: true for ALL questions here\n"
          "- Include diagram/drawing questions if present\n"
-         "- Categorise each as mcq, short_answer, or paragraph\n"
+         "- Categorise each as mcq, short_answer, or paragraph (use the natural exam format)\n"
          "- MCQs: 4 options (A-D) + correct answer + explanation\n"
          "- short_answer: model answer (2-3 sentences)\n"
          "- paragraph: marks (5-15) + detailed model answer\n\n"
@@ -64,15 +69,26 @@ def _generate_past_year_questions(llm, lecture_content: str, linkage_block: str,
          '"is_past_year": true, "difficulty": "hard"}}]\n'
          '}}')
     ])
+
+    # Target: at least as many questions as we have linkages (1-per-linkage minimum)
+    min_questions = max(linkage_count, 5)
+
     response = llm.invoke(prompt.invoke({
         "lecture_content": lecture_content[:40000],
         "linkage_block": linkage_block,
         "matched_exam_text": matched_exam_text[:15000],
+        "min_questions": min_questions,
     }))
     parsed = _parse_json_response(response.content)
     if not parsed:
         logger.warning("past_year_questions_json_parse_failed")
         return {"mcq": [], "short_answer": [], "paragraph": []}
+
+    # Force is_past_year: true on every question this call returns (safety net)
+    for category in ["mcq", "short_answer", "paragraph"]:
+        for q in parsed.get(category, []):
+            q["is_past_year"] = True
+
     return parsed
 
 
@@ -89,12 +105,11 @@ def _generate_lecture_only_questions(llm, lecture_content: str, linkage_block: s
          "- Short Answer: minimum 4 (aim 6-8)\n"
          "- Paragraph: minimum 3 (aim 4-5)\n\n"
          "**RULES:**\n"
-         "- Set is_past_year: false for ALL questions\n"
+         "- Set is_past_year: FALSE for ALL questions in this batch\n"
          "- Prioritise topics NOT in the linkages above, but you may re-angle linked topics\n"
          "- Cover ALL major lecture topics; mix difficulty easy/medium/hard\n"
          "- MCQs: 4 options (A-D) + explanation; short_answer: 2-3 sentence model answer; "
-         "paragraph: marks (5-15) + detailed model answer\n"
-         "- Include diagram/design questions where relevant\n\n"
+         "paragraph: marks (5-15) + detailed model answer\n\n"
          "DO NOT return fewer than the minimum counts.\n\n"
          "Return ONLY valid JSON:\n"
          '{{\n'
@@ -114,6 +129,12 @@ def _generate_lecture_only_questions(llm, lecture_content: str, linkage_block: s
     if not parsed:
         logger.warning("lecture_only_questions_json_parse_failed")
         return {"mcq": [], "short_answer": [], "paragraph": []}
+
+    # Force is_past_year: false on every question this call returns
+    for category in ["mcq", "short_answer", "paragraph"]:
+        for q in parsed.get(category, []):
+            q["is_past_year"] = False
+
     return parsed
 
 
@@ -131,13 +152,7 @@ def generate_practice_questions(
     lecture_content: str,
     exam_linkages: Optional[Dict] = None,
 ) -> str:
-    """
-    Generate practice questions from lecture content, with exam awareness.
-
-    Args:
-        lecture_content: Combined text from lecture note chunks
-        exam_linkages: linkage structure from cross_reference.cross_reference_chunks(), or None
-    """
+    """Generate practice questions from lecture content, with exam awareness."""
     llm = openAI["features_llm"]
     has_exam = bool(exam_linkages and exam_linkages.get("linkages"))
     logger.info("generating_practice_questions", lecture_chars=len(lecture_content), has_exam_linkages=has_exam)
@@ -145,12 +160,13 @@ def generate_practice_questions(
     if has_exam:
         linkage_block = format_linkages_for_prompt(exam_linkages)
         matched_exam_text = get_matched_exam_text(exam_linkages)
-        logger.info("exam_aware_practice_questions", linkages=len(exam_linkages["linkages"]))
+        linkage_count = len(exam_linkages["linkages"])
+        logger.info("exam_aware_practice_questions", linkages=linkage_count)
 
         logger.info("generating_past_year_questions_call")
-        past_year_qs = _generate_past_year_questions(llm, lecture_content, linkage_block, matched_exam_text)
+        past_year_qs = _generate_past_year_questions(llm, lecture_content, linkage_block, matched_exam_text, linkage_count)
         py_count = sum(len(past_year_qs.get(k, [])) for k in ["mcq", "short_answer", "paragraph"])
-        logger.info("past_year_questions_generated", count=py_count)
+        logger.info("past_year_questions_generated", count=py_count, target_min=max(linkage_count, 5))
 
         logger.info("generating_lecture_only_questions_call")
         lecture_qs = _generate_lecture_only_questions(llm, lecture_content, linkage_block)
@@ -171,7 +187,6 @@ def generate_practice_questions(
              "- Cover ALL major lecture topics; mix difficulty easy/medium/hard\n"
              "- MCQs: 4 options (A-D) + correct answer + explanation\n"
              "- short_answer: 2-3 sentence model answer; paragraph: marks (5-15) + detailed model answer\n"
-             "- Include diagram/design questions where relevant\n"
              "- Set is_past_year: false for ALL questions\n\n"
              "DO NOT return fewer than the minimum counts.\n\n"
              "Return ONLY valid JSON:\n"

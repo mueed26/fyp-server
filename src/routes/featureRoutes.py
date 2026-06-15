@@ -4,7 +4,7 @@ Feature Generation Routes.
 Endpoints:
   POST   /api/projects/{project_id}/features/generate
   POST   /api/projects/{project_id}/features/merge
-  POST   /api/projects/{project_id}/sources/{source_id}/expand   <-- NEW (generate more cards/questions)
+  POST   /api/projects/{project_id}/sources/{source_id}/expand
   GET    /api/projects/{project_id}/documents/{document_id}/features
   GET    /api/projects/{project_id}/sources
   DELETE /api/projects/{project_id}/sources/{source_id}
@@ -234,7 +234,7 @@ async def generate_features(
 
 
 # =============================================================================
-# MERGE INTO GENERATED SOURCE
+# MERGE INTO GENERATED SOURCE — FIXED VERSION
 # =============================================================================
 
 @router.post("/{project_id}/features/merge")
@@ -243,7 +243,24 @@ async def merge_features(
     request: FeatureMergeRequest,
     current_user_clerk_id: str = Depends(get_current_user_clerk_id),
 ):
-    """Merge features from documents into a generated_source."""
+    """
+    Merge features from documents into a generated_source.
+
+    🔥 BUG FIX:
+    When the user selects lecture + past_year docs and generates exam-aware
+    flashcards/practice_questions/summary, the EXAM-AWARE result is stored
+    ONLY on the lecture document (see generate_features above).
+
+    Meanwhile, the past_year doc still has its own non-exam-aware flashcards
+    from when it was first ingested.
+
+    The OLD merge_features looped over BOTH docs and grabbed contents[0] —
+    which sometimes returned the stale generic flashcards from the past_year
+    doc instead of the exam-aware ones from the lecture doc.
+
+    FIX: When past_year is selected, only read the feature content from
+    lecture docs. Their content is the exam-aware version.
+    """
     set_project_id(project_id)
     set_user_id(current_user_clerk_id)
     try:
@@ -261,11 +278,54 @@ async def merge_features(
         # mind_map is built on summary content
         db_column = "summary" if source_type == "mind_map" else source_type
 
+        # ──────────────────────────────────────────────────────────────────
+        #  Identify lecture vs past_year docs FIRST
+        # ──────────────────────────────────────────────────────────────────
+        tags_result = (
+            supabase.table("project_documents")
+            .select("id, source_tag")
+            .in_("id", request.doc_ids)
+            .execute()
+        )
+
+        lecture_doc_ids = []
+        past_year_doc_ids = []
+        for row in (tags_result.data or []):
+            if row.get("source_tag") == "past_year_paper":
+                past_year_doc_ids.append(row["id"])
+            else:
+                lecture_doc_ids.append(row["id"])
+
+        has_past_year = len(past_year_doc_ids) > 0
+        exam_aware_types = ["flashcards", "practice_questions", "summary", "mind_map"]
+
+        # When past_year is selected AND we have lecture docs, ONLY read from
+        # lecture docs. The exam-aware result was stored on the first lecture
+        # doc by /features/generate.
+        if has_past_year and lecture_doc_ids and source_type in exam_aware_types:
+            doc_ids_to_read = lecture_doc_ids
+            logger.info(
+                "merge_using_lecture_docs_only_due_to_exam_awareness",
+                source_type=source_type,
+                lecture_count=len(lecture_doc_ids),
+                excluded_past_year_count=len(past_year_doc_ids),
+            )
+        else:
+            doc_ids_to_read = request.doc_ids
+            logger.info(
+                "merge_using_all_selected_docs",
+                source_type=source_type,
+                doc_count=len(doc_ids_to_read),
+            )
+
+        # ──────────────────────────────────────────────────────────────────
+        #  Read the feature content from the chosen docs
+        # ──────────────────────────────────────────────────────────────────
         contents = []
-        for doc_id in request.doc_ids:
+        for doc_id in doc_ids_to_read:
             doc_result = (
                 supabase.table("project_documents")
-                .select(f"id, filename, {db_column}")
+                .select(f"id, filename, {db_column}, source_tag")
                 .eq("id", doc_id)
                 .eq("project_id", project_id)
                 .eq("clerk_id", current_user_clerk_id)
@@ -275,27 +335,56 @@ async def merge_features(
                 contents.append({
                     "title": doc_result.data[0].get("filename"),
                     "content": doc_result.data[0].get(db_column),
+                    "source_tag": doc_result.data[0].get("source_tag"),
                 })
 
         if not contents:
-            logger.warning("no_feature_content_found_for_merge", source_type=source_type, doc_count=len(request.doc_ids))
-            raise HTTPException(status_code=400, detail=f"No {source_type} content found. Generate features first.")
+            logger.warning(
+                "no_feature_content_found_for_merge",
+                source_type=source_type,
+                doc_count=len(doc_ids_to_read),
+                lecture_count=len(lecture_doc_ids),
+                past_year_count=len(past_year_doc_ids),
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"No {source_type} content found. Generate features first.",
+            )
 
-        logger.info("feature_content_fetched", source_type=source_type, content_count=len(contents))
+        logger.info(
+            "feature_content_fetched",
+            source_type=source_type,
+            content_count=len(contents),
+            from_source_tags=[c.get("source_tag") for c in contents],
+        )
 
+        # ──────────────────────────────────────────────────────────────────
+        #  Build the final content
+        # ──────────────────────────────────────────────────────────────────
         if source_type in ["flashcards", "practice_questions"]:
             final_content = contents[0]["content"]
             title_input = contents[0].get("title", "Practice Material")[:200]
+
         elif source_type == "mind_map":
-            summary_text = contents[0]["content"] if len(contents) == 1 else merge_contents(contents, "summary")
+            summary_text = (
+                contents[0]["content"]
+                if len(contents) == 1
+                else merge_contents(contents, "summary")
+            )
             logger.info("generating_mind_map_for_merge", source_type=source_type)
             final_content = generate_mind_map(summary_text)
             title_input = summary_text[:2000]
+
         elif len(contents) == 1:
             final_content = contents[0]["content"]
             title_input = final_content[:2000]
+
         else:
-            logger.info("merging_multiple_contents", source_type=source_type, content_count=len(contents))
+            logger.info(
+                "merging_multiple_contents",
+                source_type=source_type,
+                content_count=len(contents),
+            )
             final_content = merge_contents(contents, source_type)
             title_input = final_content[:2000]
 
@@ -308,7 +397,7 @@ async def merge_features(
             "title": title,
             "source_type": source_type,
             "content": final_content,
-            "document_ids": request.doc_ids,
+            "document_ids": request.doc_ids,  # keep ALL selected docs, so /expand can re-cross-reference
             "total_sources": len(request.doc_ids),
         }
 
@@ -317,7 +406,12 @@ async def merge_features(
             logger.error("generated_source_creation_failed", source_type=source_type, reason="no_data_returned")
             raise HTTPException(status_code=422, detail="Failed to create generated source")
 
-        logger.info("features_merged_successfully", source_type=source_type, source_id=result.data[0]["id"])
+        logger.info(
+            "features_merged_successfully",
+            source_type=source_type,
+            source_id=result.data[0]["id"],
+            had_past_year=has_past_year,
+        )
         return {"message": f"Generated {source_type} source created successfully", "data": result.data[0]}
 
     except HTTPException as e:
@@ -340,13 +434,6 @@ async def expand_source(
     """
     Generate a fresh batch of flashcards or practice questions and append them
     to an existing generated_source record.
-
-    - Fetches the source + its originating documents from the DB.
-    - Checks if exam linkages remain (only if source was exam-aware).
-    - If exam linkages available, generates exam-aware content. Otherwise falls back to lecture-only.
-    - Passes all *existing* fronts/questions to the LLM so it never duplicates.
-    - Merges new items into the existing JSON and persists back to generated_sources.
-    - Returns the full updated content so the frontend can hot-swap without reload.
     """
     set_project_id(project_id)
     set_user_id(current_user_clerk_id)
@@ -412,12 +499,10 @@ async def expand_source(
                 past_year_doc_ids.append(doc_id)
             else:
                 lecture_doc_ids.append(doc_id)
-                # Use the summary as a compact proxy for the full lecture content
                 if doc.get("summary"):
                     lecture_chunks.append(doc["summary"])
 
         if not lecture_chunks:
-            # Fallback: pull raw chunks directly
             from src.features.utils import get_document_chunks_content
             for doc_id in lecture_doc_ids:
                 lecture_chunks.extend(get_document_chunks_content(doc_id))
@@ -440,7 +525,7 @@ async def expand_source(
             for card in existing.get("flashcards", []):
                 if card.get("is_past_year"):
                     covered_exam_topics.add(card.get("topic", "").lower())
-        else:  # practice_questions
+        else:
             for q in existing.get("mcq", []) + existing.get("short_answer", []) + existing.get("paragraph", []):
                 if q.get("is_past_year"):
                     covered_exam_topics.add(q.get("topic", "").lower())
@@ -472,7 +557,6 @@ async def expand_source(
             )
             next_id = max((c["id"] for c in existing_cards), default=0) + 1
 
-            # Use exam-aware generation if there are remaining linkages
             if remaining_exam_linkages:
                 linkage_block = format_linkages_for_prompt(remaining_exam_linkages)
                 prompt = ChatPromptTemplate.from_messages([
@@ -507,7 +591,6 @@ async def expand_source(
                 }))
                 logger.info("exam_aware_flashcards_expansion", has_remaining_linkages=True)
             else:
-                # Fallback: lecture-only generation
                 prompt = ChatPromptTemplate.from_messages([
                     ("user",
                      "You are an expert tutor creating additional study flashcards.\n\n"
@@ -538,7 +621,6 @@ async def expand_source(
             new_data = json.loads(_clean_json(response.content))
             new_cards = new_data.get("flashcards", [])
 
-            # Re-assign IDs sequentially starting from next_id to be safe
             for i, card in enumerate(new_cards):
                 card["id"] = next_id + i
 
@@ -569,7 +651,6 @@ async def expand_source(
             next_short_id = max((q["id"] for q in existing_short), default=0) + 1
             next_para_id = max((q["id"] for q in existing_para), default=0) + 1
 
-            # Use exam-aware generation if there are remaining linkages
             if remaining_exam_linkages:
                 linkage_block = format_linkages_for_prompt(remaining_exam_linkages)
                 prompt = ChatPromptTemplate.from_messages([
@@ -618,7 +699,6 @@ async def expand_source(
                 }))
                 logger.info("exam_aware_questions_expansion", has_remaining_linkages=True)
             else:
-                # Fallback: lecture-only generation
                 prompt = ChatPromptTemplate.from_messages([
                     ("user",
                      "You are an expert examiner creating additional practice questions.\n\n"
@@ -667,7 +747,6 @@ async def expand_source(
             new_short = new_data.get("short_answer", [])
             new_para = new_data.get("paragraph", [])
 
-            # Re-assign IDs sequentially to be safe
             for i, q in enumerate(new_mcq):
                 q["id"] = next_mcq_id + i
             for i, q in enumerate(new_short):
@@ -750,7 +829,6 @@ async def evaluate_quiz_answer(
 
         max_marks = request.max_marks if request.max_marks and request.max_marks > 0 else 10
 
-        # Guard: empty answer -> zero, no LLM call
         if not request.user_answer.strip():
             return {
                 "awarded_marks": 0,
@@ -789,7 +867,6 @@ Grading rules:
 
         result: QuizEvaluation = llm.invoke(prompt)
 
-        # Clamp awarded marks defensively
         awarded = max(0.0, min(float(result.awarded_marks), float(max_marks)))
 
         logger.info("quiz_answer_evaluated", awarded=awarded, max_marks=max_marks, verdict=result.verdict)

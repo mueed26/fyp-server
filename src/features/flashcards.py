@@ -4,23 +4,6 @@ Flashcard Generation Pipeline.
 Consumes the exam linkage structure from cross_reference.py so cards can be
 weighted toward content that actually appeared in past exams, and the LLM sees
 the real exam question text (not just a topic label).
-
-Output format:
-{
-  "flashcards": [
-    {
-      "id": 1,
-      "front": "...",
-      "back": "...",
-      "topic": "...",
-      "is_past_year": true,
-      "exam_similarity": 0.87,
-      "difficulty": "medium"
-    }
-  ],
-  "total": 20,
-  "exam_relevant_count": 8
-}
 """
 
 import json
@@ -48,20 +31,18 @@ def generate_flashcards(
     lecture_content: str,
     exam_linkages: Optional[Dict] = None,
 ) -> str:
-    """
-    Generate flashcards from lecture content, with exam awareness.
-
-    Args:
-        lecture_content: Combined text from lecture note chunks
-        exam_linkages: linkage structure from cross_reference.cross_reference_chunks(), or None
-    """
+    """Generate flashcards from lecture content, with exam awareness."""
     llm = openAI["features_llm"]
     has_exam = bool(exam_linkages and exam_linkages.get("linkages"))
     logger.info("generating_flashcards", lecture_chars=len(lecture_content), has_exam_linkages=has_exam)
 
     if has_exam:
         linkage_block = format_linkages_for_prompt(exam_linkages)
-        logger.info("exam_aware_flashcards", linkages=len(exam_linkages["linkages"]))
+        linkage_count = len(exam_linkages["linkages"])
+        logger.info("exam_aware_flashcards", linkages=linkage_count)
+
+        # We want MANY exam-relevant cards — at least 2 per linkage
+        min_exam_cards = max(linkage_count * 2, 8)
 
         prompt = ChatPromptTemplate.from_messages([
             ("user",
@@ -70,14 +51,23 @@ def generate_flashcards(
              "=== EXAM LINKAGES ===\n"
              "Lecture sections paired with the ACTUAL past-year exam questions they "
              "matched (higher similarity = tested more directly):\n\n{linkage_block}\n\n"
-             "Generate 20-30 flashcards.\n\n"
-             "**Priority rules:**\n"
-             "- Create MORE cards (3-4) for linkages with high similarity; fewer (1) for low\n"
-             "- For linked content, base the card on what the real exam question asked\n"
-             "- Set is_past_year: true and exam_similarity to the linkage similarity for these\n"
-             "- Also cover important lecture topics with NO linkage "
-             "(is_past_year: false, exam_similarity: 0.0)\n"
-             "- Mix difficulty: easy, medium, hard\n\n"
+             "**MANDATORY OUTPUT REQUIREMENTS:**\n"
+             "- Generate at LEAST {min_exam_cards} EXAM-RELEVANT cards (is_past_year: true)\n"
+             "- For EACH linkage above, produce 2-3 flashcards covering different angles\n"
+             "- Then add 8-15 ADDITIONAL cards covering important lecture topics with "
+             "NO linkage (is_past_year: false)\n"
+             "- Total target: 25-35 flashcards\n\n"
+             "**Rules for exam-relevant cards (is_past_year: true):**\n"
+             "- Base the card on what the real exam question asked\n"
+             "- Set exam_similarity to the linkage similarity score\n"
+             "- Different cards from the same linkage should test different aspects\n"
+             "  (e.g., definition vs. example vs. application)\n\n"
+             "**Rules for non-exam cards (is_past_year: false):**\n"
+             "- Cover lecture topics that didn't appear in the linkages\n"
+             "- Set exam_similarity: 0.0\n\n"
+             "**General rules:**\n"
+             "- Mix difficulty: easy, medium, hard\n"
+             "- Front: clear question. Back: complete answer (2-3 sentences)\n\n"
              "Return ONLY valid JSON, no other text:\n"
              '{{\n'
              '  "flashcards": [\n'
@@ -89,6 +79,7 @@ def generate_flashcards(
         response = llm.invoke(prompt.invoke({
             "lecture_content": lecture_content[:15000],
             "linkage_block": linkage_block,
+            "min_exam_cards": min_exam_cards,
         }))
     else:
         prompt = ChatPromptTemplate.from_messages([

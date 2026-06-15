@@ -46,6 +46,7 @@ appConfig = {
     "claude_api_key": os.getenv("CLAUDE_API_KEY"),
     "tavily_api_key": os.getenv("TAVILY_API_KEY"),
     "scrapingbee_api_key": os.getenv("SCRAPINGBEE_API_KEY"),
-    # "stripe_secret_key": os.getenv("STRIPE_SECRET_KEY"),
+
+
    
 }

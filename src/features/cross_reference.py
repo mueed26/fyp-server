@@ -15,11 +15,6 @@ the HNSW-backed RPC once per chunk (expensive), we:
 
 Cost per cross-reference = 2 DB reads + one matrix multiply.
 No RPC calls. No OpenAI embedding calls. No LLM topic extraction.
-
-This is chunk-to-chunk semantic matching — the highest-fidelity comparison
-available — and it returns the ACTUAL matched past-year question text, so the
-downstream generators can see "this lecture section corresponds to this real
-exam question", not just a topic label.
 """
 
 import json
@@ -97,7 +92,6 @@ def _readable_text(chunk: dict) -> str:
             return text
     elif isinstance(original, str) and original:
         return original
-    # Fallback to the AI summary content
     return chunk.get("content", "") or ""
 
 
@@ -140,15 +134,15 @@ def _fetch_chunks(doc_ids: List[str]) -> List[dict]:
 def _normalise(matrix: np.ndarray) -> np.ndarray:
     """L2-normalise rows so a dot product gives cosine similarity directly."""
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1e-8, norms)  # guard against zero vectors
+    norms = np.where(norms == 0, 1e-8, norms)
     return matrix / norms
 
 
 def cross_reference_chunks(
     lecture_doc_ids: List[str],
     past_year_doc_ids: List[str],
-    similarity_threshold: float = 0.45,
-    max_linkages: int = 20,
+    similarity_threshold: float = 0.35,   # 🔥 LOWERED from 0.45 to 0.35
+    max_linkages: int = 40,                # 🔥 RAISED from 20 to 40
 ) -> Optional[Dict]:
     """
     Compare every lecture chunk against every past year chunk using their
@@ -158,26 +152,15 @@ def cross_reference_chunks(
         lecture_doc_ids: document IDs tagged lecture_notes (selected by user)
         past_year_doc_ids: document IDs tagged past_year_paper (selected by user)
         similarity_threshold: cosine cutoff for "this lecture content appeared
-            in the exam". For text-embedding-3-large, on-topic chunk pairs sit
-            around 0.45-0.65, near-duplicates 0.7+. 0.45 is a sensible default.
-        max_linkages: cap on how many linkages we surface to the prompt (token budget)
+            in the exam". For text-embedding-3-large:
+              0.7+ = near-duplicate
+              0.5-0.7 = strongly related
+              0.4-0.5 = same topic
+              0.3-0.4 = loosely related
+            Default 0.35 is generous — surfaces more matches.
+        max_linkages: cap on how many linkages we surface (token budget)
 
-    Returns a rich linkage structure, or None if cross-referencing isn't possible:
-        {
-          "linkages": [
-            {
-              "lecture_excerpt": "...real lecture text...",
-              "exam_excerpt": "...the matched past year question text...",
-              "similarity": 0.87,
-              "lecture_page": 12,
-              "exam_page": 3,
-            }, ...   # one per matched lecture chunk, sorted by similarity desc
-          ],
-          "exam_coverage_score": 0.62,   # fraction of lecture chunks with an exam match
-          "matched_lecture_chunks": 31,
-          "total_lecture_chunks": 50,
-          "total_exam_chunks": 28,
-        }
+    Returns rich linkage structure or None if cross-referencing isn't possible.
     """
     if not lecture_doc_ids or not past_year_doc_ids:
         logger.warning(
@@ -201,16 +184,27 @@ def cross_reference_chunks(
         logger.warning("cross_reference_no_usable_chunks")
         return None
 
-    # Build normalised matrices: L (n_lecture x 1536), P (n_exam x 1536)
     L = _normalise(np.vstack([c["embedding"] for c in lecture_chunks]))
     P = _normalise(np.vstack([c["embedding"] for c in exam_chunks]))
 
-    # Cosine similarity matrix: (n_lecture x n_exam). This is the whole job.
     sim = L @ P.T
 
-    # For each lecture chunk, its single best-matching exam chunk + score
     best_exam_idx = np.argmax(sim, axis=1)
     best_sim = np.max(sim, axis=1)
+
+    # 🔥 BETTER LOGGING: see the score distribution to tune threshold
+    if len(best_sim) > 0:
+        logger.info(
+            "cross_reference_score_distribution",
+            max_score=float(np.max(best_sim)),
+            mean_score=float(np.mean(best_sim)),
+            median_score=float(np.median(best_sim)),
+            scores_above_0_5=int(np.sum(best_sim >= 0.5)),
+            scores_above_0_4=int(np.sum(best_sim >= 0.4)),
+            scores_above_0_35=int(np.sum(best_sim >= 0.35)),
+            scores_above_0_3=int(np.sum(best_sim >= 0.3)),
+            threshold_used=similarity_threshold,
+        )
 
     linkages = []
     matched = 0
@@ -228,7 +222,6 @@ def cross_reference_chunks(
             "exam_page": exam_chunk["page"],
         })
 
-    # Highest-similarity linkages first; cap for token budget
     linkages.sort(key=lambda x: x["similarity"], reverse=True)
     linkages = linkages[:max_linkages]
 
@@ -240,6 +233,7 @@ def cross_reference_chunks(
         total_lecture_chunks=len(lecture_chunks),
         surfaced_linkages=len(linkages),
         exam_coverage_score=coverage,
+        threshold_used=similarity_threshold,
     )
 
     return {
@@ -280,8 +274,6 @@ def format_linkages_for_prompt(linkage_result: Optional[Dict]) -> str:
 def get_matched_exam_text(linkage_result: Optional[Dict]) -> str:
     """
     Deduplicated past-year exam excerpts that actually matched lecture content.
-    This is the pre-filtered "relevant exam questions" text - far better than
-    dumping the entire exam paper, because it's already scoped to the lecture.
     """
     if not linkage_result or not linkage_result.get("linkages"):
         return ""
